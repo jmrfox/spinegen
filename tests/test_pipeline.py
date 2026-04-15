@@ -20,7 +20,7 @@ def main():
     analyzer = spinegen.SpineAnalyzer(graphs)
     stats = analyzer.analyze()
 
-    print(f"Segment lengths: {len(stats['segment_lengths'])} samples")
+    print(f"Thread lengths: {len(stats['thread_lengths'])} samples")
     print(f"Curvatures: {len(stats['curvatures'])} samples")
     print(f"Branch counts: {len(stats['branch_counts'])} samples")
     print(f"Fusion distances: {len(stats['fusion_distances'])} samples")

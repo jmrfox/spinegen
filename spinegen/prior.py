@@ -2,16 +2,85 @@
 
 This module provides the SpinePrior class which fits parametric distributions
 to morphological statistics and provides sampling methods for generation.
+Supports optional copula-based joint distributions for correlated features.
 """
 
 import logging
 import numpy as np
-from typing import Dict, Any, Optional
+import pandas as pd
+from typing import Dict, Any, Optional, Tuple, List, Literal
 from scipy import stats
 import matplotlib.pyplot as plt
 import seaborn as sns
+from copulas.bivariate import Clayton, Frank, Gumbel
+from copulas.multivariate import GaussianMultivariate, VineCopula
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+# Map copula type names to classes
+COPULA_CLASSES = {
+    "gaussian": GaussianMultivariate,  # Use Gaussian for bivariate too
+    "clayton": Clayton,
+    "frank": Frank,
+    "gumbel": Gumbel,
+}
+
+"""Configuration options for SpinePrior.
+
+This module provides the SpinePriorOptions dataclass for configuring
+copula-based joint distributions in the SpinePrior class.
+"""
+
+
+CopulaType = Literal["gaussian", "clayton", "gumbel", "frank"]
+MultivariateCopulaType = Literal["gaussian", "vine"]
+
+
+@dataclass
+class SpinePriorOptions:
+    """Configuration options for SpinePrior copula modeling.
+
+    Attributes:
+        use_copulas: If True, fit copulas for joint distributions
+        copula_type: Type of copula for bivariate distributions
+        use_multivariate: If True, fit single multivariate copula
+        multivariate_type: Type of multivariate copula
+
+    Examples:
+        # Independent distributions (no copulas)
+        options = SpinePriorOptions()
+
+        # Gaussian copulas for pairwise correlations
+        options = SpinePriorOptions(use_copulas=True)
+
+        # Clayton copulas (lower tail dependence)
+        options = SpinePriorOptions(use_copulas=True, copula_type="clayton")
+
+        # Multivariate Gaussian copula (all features jointly)
+        options = SpinePriorOptions(
+            use_copulas=True,
+            use_multivariate=True,
+            multivariate_type="gaussian"
+        )
+
+        # Vine copula (flexible multivariate)
+        options = SpinePriorOptions(
+            use_copulas=True,
+            use_multivariate=True,
+            multivariate_type="vine"
+        )
+    """
+
+    use_copulas: bool = False
+    copula_type: CopulaType = "gaussian"
+    use_multivariate: bool = False
+    multivariate_type: MultivariateCopulaType = "gaussian"
+
+    def __post_init__(self):
+        """Validate configuration."""
+        if self.use_multivariate and not self.use_copulas:
+            raise ValueError("use_multivariate=True requires use_copulas=True")
 
 
 class SpinePrior:
@@ -19,56 +88,72 @@ class SpinePrior:
 
     This class takes statistics from SpineAnalyzer and fits parametric
     probability distributions that can be sampled during generation.
+    Optionally supports copula-based joint distributions for modeling
+    correlations between features.
 
     Attributes:
         stats: Dictionary of morphological statistics from analyzer
-        distributions: Dictionary of fitted distribution parameters
+        distributions: Dictionary of fitted marginal distribution parameters
+        options: Configuration options for copula modeling
+        copulas: Dictionary of fitted copula models (if enabled)
 
     Distributions Fitted:
-        - segment_length: Gamma distribution
+        - thread_length: Gamma distribution
         - curvature: Normal distribution (clipped to [0, π])
         - branch_count: Categorical distribution
         - branch_angle: Normal distribution (clipped to [0, π])
         - radius: LogNormal distribution with tapering
         - fusion_distance: Exponential distribution
         - fusion_graph_distance: Empirical (mean, std)
+
+    Joint Distributions (if copulas enabled):
+        - (thread_length, curvature): Longer threads tend to be straighter
+        - (branch_count, branch_angle): Branch count may correlate with angles
+        - (fusion_distance, fusion_graph_distance): Spatial-topological correlation
+        - Multivariate: All features jointly (optional)
     """
 
-    def __init__(self, analyzer_stats: Dict[str, Any]):
+    def __init__(
+        self,
+        analyzer_stats: Dict[str, Any],
+        options: Optional[SpinePriorOptions] = None,
+    ):
         """Initialize prior and fit distributions to statistics.
 
         Args:
             analyzer_stats: Dictionary of statistics from SpineAnalyzer.analyze()
+            options: Configuration options for copula modeling. If None, uses
+                    default (no copulas, independent distributions)
         """
         self.stats = analyzer_stats
-        self.distributions = {}
+        self.options = options if options is not None else SpinePriorOptions()
+        self.distributions: Dict[str, Any] = {}
+        self.copulas: Dict[str, Any] = {}
+
         logger.info("Initializing SpinePrior and fitting distributions")
         self._fit_distributions()
-        logger.info(f"Fitted {len(self.distributions)} distributions")
+        logger.info(f"Fitted {len(self.distributions)} marginal distributions")
+
+        if self.options.use_copulas:
+            self._fit_copulas()
+            logger.info(f"Fitted {len(self.copulas)} copula model(s)")
 
     def _fit_distributions(self) -> None:
-        """Fit parametric distributions to all available statistics.
-
-        This method fits appropriate distributions to each statistic type:
-        - Gamma for positive continuous values (lengths)
-        - Normal for angular measurements
-        - Categorical for discrete counts
-        - LogNormal for radii
-        - Exponential for fusion distances
-        """
+        """Fit parametric distributions to all available statistics."""
         logger.debug("Fitting distributions to statistics")
 
-        if len(self.stats["segment_lengths"]) > 0:
-            lengths = self.stats["segment_lengths"]
+        if len(self.stats["thread_lengths"]) > 0:
+            lengths = self.stats["thread_lengths"]
             lengths = lengths[lengths > 0]
             if len(lengths) > 0:
                 shape, loc, scale = stats.gamma.fit(lengths)
-                self.distributions["segment_length"] = {
+                self.distributions["thread_length"] = {
                     "type": "gamma",
                     "params": {"shape": shape, "loc": loc, "scale": scale},
                 }
                 logger.debug(
-                    f"Fitted Gamma to segment_length: shape={shape:.3f}, scale={scale:.3f}"
+                    f"Fitted Gamma to thread_length: "
+                    f"shape={shape:.3f}, scale={scale:.3f}"
                 )
 
         if len(self.stats["curvatures"]) > 0:
@@ -138,35 +223,229 @@ class SpinePrior:
                     "params": {"mean": mean_dist, "std": std_dist},
                 }
                 logger.debug(
-                    f"Fitted Empirical to fusion_graph_distance: mean={mean_dist:.3f}"
+                    f"Fitted Empirical to fusion_graph_distance: "
+                    f"mean={mean_dist:.3f}"
                 )
 
-    def sample_segment_length(self) -> float:
-        """Sample a segment length from the fitted distribution.
+    def _fit_copulas(self) -> None:
+        """Fit copulas for joint distributions."""
+        if self.options.use_multivariate:
+            logger.info(f"Fitting {self.options.multivariate_type} multivariate copula")
+            self._fit_multivariate_copula()
+        else:
+            logger.info(f"Fitting {self.options.copula_type} bivariate copulas")
+            self._fit_bivariate_copulas()
 
-        Returns:
-            Segment length value (default 10.0 if no distribution fitted)
-        """
-        if "segment_length" not in self.distributions:
-            logger.debug("No segment_length distribution, using default 10.0")
+    def _fit_bivariate_copulas(self) -> None:
+        """Fit bivariate copulas for pairwise feature correlations."""
+        if len(self.stats["thread_lengths"]) > 0 and len(self.stats["curvatures"]) > 0:
+            self._fit_bivariate_copula(
+                "length_curvature",
+                self.stats["thread_lengths"],
+                self.stats["curvatures"],
+                ["thread_length", "curvature"],
+            )
+
+        if (
+            len(self.stats["branch_counts"]) > 0
+            and len(self.stats["branch_angles"]) > 0
+        ):
+            self._fit_bivariate_copula(
+                "branch",
+                self.stats["branch_counts"],
+                self.stats["branch_angles"],
+                ["branch_count", "branch_angle"],
+            )
+
+        if (
+            len(self.stats["fusion_distances"]) > 0
+            and len(self.stats["fusion_graph_distances"]) > 0
+        ):
+            self._fit_bivariate_copula(
+                "fusion",
+                self.stats["fusion_distances"],
+                self.stats["fusion_graph_distances"],
+                ["fusion_distance", "fusion_graph_distance"],
+            )
+
+    def _fit_bivariate_copula(
+        self, name: str, data1: np.ndarray, data2: np.ndarray, feature_names: List[str]
+    ) -> None:
+        """Fit bivariate copula to two features using copulas package."""
+        n_samples = min(len(data1), len(data2))
+        data1 = data1[:n_samples]
+        data2 = data2[:n_samples]
+
+        # Clean data: remove invalid values
+        valid_mask = np.isfinite(data1) & np.isfinite(data2)
+        if name == "length_curvature":
+            valid_mask &= data1 > 0
+        elif name == "fusion":
+            valid_mask &= (data1 > 0) & (data2 > 0)
+
+        data1 = data1[valid_mask]
+        data2 = data2[valid_mask]
+
+        # Check for sufficient data
+        if len(data1) < 30:
+            logger.warning(
+                f"Insufficient data for {name} copula: {len(data1)} samples "
+                f"(minimum 30 recommended)"
+            )
+            return
+
+        # Remove outliers that can cause fitting issues (beyond 3 std devs)
+        def remove_outliers(data):
+            if len(data) < 10:
+                return data
+            mean, std = np.mean(data), np.std(data)
+            if std > 0:
+                mask = np.abs(data - mean) <= 3 * std
+                return data[mask]
+            return data
+
+        # Create aligned dataset without outliers
+        combined = np.column_stack([data1, data2])
+        mask1 = np.abs(data1 - np.mean(data1)) <= 3 * np.std(data1)
+        mask2 = np.abs(data2 - np.mean(data2)) <= 3 * np.std(data2)
+        combined_mask = mask1 & mask2
+
+        data1_clean = data1[combined_mask]
+        data2_clean = data2[combined_mask]
+
+        if len(data1_clean) < 20:
+            logger.warning(
+                f"Too few samples after outlier removal for {name}: "
+                f"{len(data1_clean)} (need at least 20)"
+            )
+            return
+
+        df = pd.DataFrame(
+            {feature_names[0]: data1_clean, feature_names[1]: data2_clean}
+        )
+
+        try:
+            # For Gaussian, use GaussianMultivariate even for bivariate
+            if self.options.copula_type == "gaussian":
+                copula = GaussianMultivariate()
+            else:
+                # Get the specific copula class
+                copula_class = COPULA_CLASSES.get(self.options.copula_type)
+                if copula_class is None:
+                    logger.error(f"Unknown copula type: {self.options.copula_type}")
+                    return
+                copula = copula_class()
+
+            copula.fit(df)
+
+            self.copulas[name] = {
+                "model": copula,
+                "type": "bivariate",
+                "copula_type": self.options.copula_type,
+                "marginals": feature_names,
+            }
+
+            logger.info(f"Fitted {self.options.copula_type} copula for {name}")
+        except Exception as e:
+            logger.error(f"Failed to fit copula for {name}: {e}")
+
+    def _fit_multivariate_copula(self) -> None:
+        """Fit multivariate copula to all features simultaneously."""
+        feature_data = {}
+        feature_names = []
+
+        if len(self.stats["thread_lengths"]) > 0:
+            feature_data["thread_length"] = self.stats["thread_lengths"]
+            feature_names.append("thread_length")
+
+        if len(self.stats["curvatures"]) > 0:
+            feature_data["curvature"] = self.stats["curvatures"]
+            feature_names.append("curvature")
+
+        if len(self.stats["branch_counts"]) > 0:
+            feature_data["branch_count"] = self.stats["branch_counts"]
+            feature_names.append("branch_count")
+
+        if len(self.stats["branch_angles"]) > 0:
+            feature_data["branch_angle"] = self.stats["branch_angles"]
+            feature_names.append("branch_angle")
+
+        if len(self.stats["radii"]) > 0:
+            feature_data["radius"] = self.stats["radii"]
+            feature_names.append("radius")
+
+        if len(feature_names) < 2:
+            logger.warning("Insufficient features for multivariate copula")
+            return
+
+        # Align all features to same length
+        n_samples = min(len(data) for data in feature_data.values())
+        df_data = {name: feature_data[name][:n_samples] for name in feature_names}
+        df = pd.DataFrame(df_data)
+
+        # Clean data: remove infinities and NaNs
+        df = df.replace([np.inf, -np.inf], np.nan).dropna()
+
+        if len(df) < 30:
+            logger.warning(
+                f"Insufficient valid data for multivariate copula: {len(df)} "
+                f"samples (minimum 30 recommended)"
+            )
+            return
+
+        # Remove outliers from each feature (beyond 3 std devs)
+        for col in df.columns:
+            mean, std = df[col].mean(), df[col].std()
+            if std > 0:
+                df = df[np.abs(df[col] - mean) <= 3 * std]
+
+        if len(df) < 20:
+            logger.warning(
+                f"Too few samples after outlier removal: {len(df)} "
+                f"(need at least 20)"
+            )
+            return
+
+        try:
+            if self.options.multivariate_type == "gaussian":
+                copula = GaussianMultivariate()
+            else:
+                copula = VineCopula(vine_type="regular")
+
+            copula.fit(df)
+
+            self.copulas["multivariate"] = {
+                "model": copula,
+                "type": "multivariate",
+                "copula_type": self.options.multivariate_type,
+                "marginals": feature_names,
+            }
+
+            logger.info(
+                f"Fitted {self.options.multivariate_type} multivariate copula "
+                f"with {len(feature_names)} features"
+            )
+        except Exception as e:
+            logger.error(f"Failed to fit multivariate copula: {e}")
+
+    def sample_thread_length(self) -> float:
+        """Sample a thread length from the fitted distribution."""
+        if "thread_length" not in self.distributions:
+            logger.debug("No thread_length distribution, using default 10.0")
             return 10.0
 
-        dist = self.distributions["segment_length"]
+        dist = self.distributions["thread_length"]
         if dist["type"] == "gamma":
             params = dist["params"]
             value = stats.gamma.rvs(
                 params["shape"], loc=params["loc"], scale=params["scale"]
             )
-            logger.debug(f"Sampled segment_length: {value:.3f}")
+            logger.debug(f"Sampled thread_length: {value:.3f}")
             return value
         return 10.0
 
     def sample_curvature(self) -> float:
-        """Sample a curvature angle from the fitted distribution.
-
-        Returns:
-            Curvature angle in radians, clipped to [0, π] (default 0.1)
-        """
+        """Sample a curvature angle from the fitted distribution."""
         if "curvature" not in self.distributions:
             return 0.1
 
@@ -178,11 +457,7 @@ class SpinePrior:
         return 0.1
 
     def sample_branch_count(self) -> int:
-        """Sample number of branches from the fitted distribution.
-
-        Returns:
-            Number of branches (default 2 if no distribution fitted)
-        """
+        """Sample number of branches from the fitted distribution."""
         if "branch_count" not in self.distributions:
             return 2
 
@@ -195,11 +470,7 @@ class SpinePrior:
         return 2
 
     def sample_branch_angle(self) -> float:
-        """Sample a branch angle from the fitted distribution.
-
-        Returns:
-            Branch angle in radians, clipped to [0, π] (default π/3)
-        """
+        """Sample a branch angle from the fitted distribution."""
         if "branch_angle" not in self.distributions:
             return np.pi / 3
 
@@ -211,18 +482,7 @@ class SpinePrior:
         return np.pi / 3
 
     def sample_radius(self, distance_from_root: float = 0.0) -> float:
-        """Sample a radius with distance-based tapering.
-
-        Args:
-            distance_from_root: Path distance from root node (for tapering)
-
-        Returns:
-            Radius value with exponential tapering applied (default 1.0)
-
-        Note:
-            Tapering factor is exp(-distance/1000), causing radii to decrease
-            with distance from the root.
-        """
+        """Sample a radius with distance-based tapering."""
         if "radius" not in self.distributions:
             return 1.0
 
@@ -233,17 +493,14 @@ class SpinePrior:
             taper_factor = np.exp(-distance_from_root / 1000.0)
             final_radius = base_radius * taper_factor
             logger.debug(
-                f"Sampled radius: {final_radius:.3f} (base={base_radius:.3f}, taper={taper_factor:.3f})"
+                f"Sampled radius: {final_radius:.3f} "
+                f"(base={base_radius:.3f}, taper={taper_factor:.3f})"
             )
             return final_radius
         return 1.0
 
     def sample_fusion_distance(self) -> float:
-        """Sample a fusion search distance from the fitted distribution.
-
-        Returns:
-            Fusion search radius (default 50.0 if no distribution fitted)
-        """
+        """Sample a fusion search distance from the fitted distribution."""
         if "fusion_distance" not in self.distributions:
             return 50.0
 
@@ -253,26 +510,84 @@ class SpinePrior:
             return stats.expon.rvs(loc=params["loc"], scale=params["scale"])
         return 50.0
 
+    def sample_length_curvature_joint(self) -> Tuple[float, float]:
+        """Sample thread length and curvature jointly from copula."""
+        if "length_curvature" not in self.copulas:
+            return (self.sample_thread_length(), self.sample_curvature())
+
+        copula_model = self.copulas["length_curvature"]["model"]
+        sample = copula_model.sample(1)
+
+        length = float(sample["thread_length"].iloc[0])
+        curvature = float(sample["curvature"].iloc[0])
+
+        logger.debug(f"Sampled joint (length={length:.2f}, curv={curvature:.3f})")
+        return length, curvature
+
+    def sample_branch_joint(self) -> Tuple[int, float]:
+        """Sample branch count and angle jointly from copula."""
+        if "branch" not in self.copulas:
+            return (self.sample_branch_count(), self.sample_branch_angle())
+
+        copula_model = self.copulas["branch"]["model"]
+        sample = copula_model.sample(1)
+
+        count = int(round(sample["branch_count"].iloc[0]))
+        angle = float(sample["branch_angle"].iloc[0])
+
+        logger.debug(f"Sampled joint (count={count}, angle={angle:.3f})")
+        return count, angle
+
+    def sample_fusion_distances_joint(self) -> Tuple[float, float]:
+        """Sample fusion spatial and graph distances jointly."""
+        if "fusion" not in self.copulas:
+            return (
+                self.sample_fusion_distance(),
+                self._sample_fusion_graph_distance(),
+            )
+
+        copula_model = self.copulas["fusion"]["model"]
+        sample = copula_model.sample(1)
+
+        spatial = float(sample["fusion_distance"].iloc[0])
+        graph = float(sample["fusion_graph_distance"].iloc[0])
+
+        return spatial, graph
+
+    def sample_multivariate(self) -> Dict[str, float]:
+        """Sample all features jointly from multivariate copula."""
+        if "multivariate" not in self.copulas:
+            logger.warning("No multivariate copula fitted")
+            return {}
+
+        copula_model = self.copulas["multivariate"]["model"]
+        feature_names = self.copulas["multivariate"]["marginals"]
+
+        sample = copula_model.sample(1)
+
+        result = {}
+        for feature in feature_names:
+            value = float(sample[feature].iloc[0])
+            if feature == "branch_count":
+                value = int(round(value))
+            result[feature] = value
+
+        logger.debug(f"Sampled multivariate: {result}")
+        return result
+
+    def _sample_fusion_graph_distance(self) -> float:
+        """Sample fusion graph distance (fallback helper)."""
+        if "fusion_graph_distance" in self.distributions:
+            dist = self.distributions["fusion_graph_distance"]
+            if dist["type"] == "empirical":
+                p = dist["params"]
+                return np.random.normal(p["mean"], p["std"])
+        return 100.0
+
     def compute_fusion_probability(
         self, spatial_dist: float, graph_dist: float
     ) -> float:
-        """Compute probability of fusion based on spatial and graph distances.
-
-        The fusion probability combines two factors:
-        1. Spatial proximity: Gaussian decay with distance
-        2. Graph distance: Preference for longer graph paths (more likely to
-           create interesting cycles)
-
-        Args:
-            spatial_dist: Euclidean distance between fusion candidates
-            graph_dist: Graph path length (with fusion edge removed)
-
-        Returns:
-            Fusion probability in [0, 1]
-
-        Note:
-            Returns 0 if graph_dist is infinite (no path exists).
-        """
+        """Compute probability of fusion based on spatial and graph distances."""
         if "fusion_distance" not in self.distributions:
             sigma = 50.0
         else:
@@ -297,45 +612,45 @@ class SpinePrior:
 
         fusion_prob = spatial_prob * graph_prob
         logger.debug(
-            f"Fusion probability: {fusion_prob:.4f} (spatial={spatial_prob:.4f}, graph={graph_prob:.4f})"
+            f"Fusion probability: {fusion_prob:.4f} "
+            f"(spatial={spatial_prob:.4f}, graph={graph_prob:.4f})"
         )
         return fusion_prob
 
     def __str__(self) -> str:
-        """Return string representation of prior distributions.
-
-        Returns:
-            Formatted string with all distribution information
-        """
+        """Return string representation of prior distributions."""
         return self.print()
 
     def print(self) -> str:
-        """Generate comprehensive information about all fitted distributions.
-
-        Returns:
-            Formatted string with distribution types, parameters, and summary
-            statistics for all morphological features
-        """
+        """Generate comprehensive information about all fitted distributions."""
         lines = []
         lines.append("=" * 70)
         lines.append("SpinePrior Distribution Information")
         lines.append("=" * 70)
+
+        if self.options.use_copulas:
+            lines.append(f"Copula Mode: {self.options.copula_type}")
+            if self.options.use_multivariate:
+                lines.append(f"Multivariate: {self.options.multivariate_type}")
+        else:
+            lines.append("Copula Mode: Disabled (independent distributions)")
         lines.append("")
 
-        # Segment Length
-        if "segment_length" in self.distributions:
-            dist = self.distributions["segment_length"]
-            lines.append("SEGMENT LENGTH")
+        # Thread Length
+        if "thread_length" in self.distributions:
+            dist = self.distributions["thread_length"]
+            lines.append("THREAD LENGTH")
             lines.append(f"  Distribution: {dist['type'].capitalize()}")
             if dist["type"] == "gamma":
                 p = dist["params"]
                 mean = p["shape"] * p["scale"] + p["loc"]
                 lines.append(
-                    f"  Parameters: shape={p['shape']:.3f}, loc={p['loc']:.3f}, scale={p['scale']:.3f}"
+                    f"  Parameters: shape={p['shape']:.3f}, "
+                    f"loc={p['loc']:.3f}, scale={p['scale']:.3f}"
                 )
                 lines.append(f"  Mean: {mean:.3f}")
         else:
-            lines.append("SEGMENT LENGTH: Not fitted (default: 10.0)")
+            lines.append("THREAD LENGTH: Not fitted (default: 10.0)")
         lines.append("")
 
         # Curvature
@@ -422,12 +737,24 @@ class SpinePrior:
             lines.append("FUSION GRAPH DISTANCE: Not fitted (default mean: 100.0)")
         lines.append("")
 
+        # Copula information
+        if len(self.copulas) > 0:
+            lines.append("=" * 70)
+            lines.append("Copula Models")
+            lines.append("=" * 70)
+
+            for name, copula in self.copulas.items():
+                copula_type = copula["copula_type"]
+                marginals = " <-> ".join(copula["marginals"])
+                lines.append(f"  {name}: {copula_type} ({marginals})")
+            lines.append("")
+
         # Summary Statistics
         lines.append("=" * 70)
         lines.append("Summary Statistics from Analyzed Data")
         lines.append("=" * 70)
         lines.append(
-            f"  Segment lengths: {len(self.stats.get('segment_lengths', []))} samples"
+            f"  Thread lengths: {len(self.stats.get('thread_lengths', []))} samples"
         )
         lines.append(f"  Curvatures: {len(self.stats.get('curvatures', []))} samples")
         lines.append(
@@ -438,10 +765,12 @@ class SpinePrior:
         )
         lines.append(f"  Radii: {len(self.stats.get('radii', []))} samples")
         lines.append(
-            f"  Fusion distances: {len(self.stats.get('fusion_distances', []))} samples"
+            f"  Fusion distances: "
+            f"{len(self.stats.get('fusion_distances', []))} samples"
         )
         lines.append(
-            f"  Fusion graph distances: {len(self.stats.get('fusion_graph_distances', []))} samples"
+            f"  Fusion graph distances: "
+            f"{len(self.stats.get('fusion_graph_distances', []))} samples"
         )
         lines.append("=" * 70)
 
@@ -450,23 +779,7 @@ class SpinePrior:
     def plot_distributions(
         self, figsize: Optional[tuple] = None, save_path: Optional[str] = None
     ) -> plt.Figure:
-        """Plot all fitted probability distributions.
-
-        Creates a multi-panel figure showing histograms of the original data
-        overlaid with the fitted probability density functions for each
-        morphological feature.
-
-        Args:
-            figsize: Figure size as (width, height). Default: (16, 12)
-            save_path: Optional path to save the figure. If None, displays only.
-
-        Returns:
-            matplotlib Figure object
-
-        Examples:
-            >>> prior.plot_distributions()
-            >>> prior.plot_distributions(figsize=(20, 15), save_path="prior.png")
-        """
+        """Plot all fitted probability distributions."""
         if figsize is None:
             figsize = (16, 12)
 
@@ -476,10 +789,10 @@ class SpinePrior:
 
         plot_idx = 0
 
-        # 1. Segment Length
-        if "segment_length" in self.distributions:
+        # 1. Thread Length
+        if "thread_length" in self.distributions:
             ax = axes[plot_idx]
-            data = self.stats["segment_lengths"]
+            data = self.stats["thread_lengths"]
             data = data[data > 0]
 
             if len(data) > 0:
@@ -493,16 +806,16 @@ class SpinePrior:
                     label="Data",
                 )
 
-                dist = self.distributions["segment_length"]
+                dist = self.distributions["thread_length"]
                 if dist["type"] == "gamma":
                     p = dist["params"]
                     x = np.linspace(data.min(), data.max(), 200)
                     y = stats.gamma.pdf(x, p["shape"], loc=p["loc"], scale=p["scale"])
                     ax.plot(x, y, "r-", linewidth=2, label="Fitted Gamma")
 
-                ax.set_xlabel("Segment Length")
+                ax.set_xlabel("Thread Length")
                 ax.set_ylabel("Density")
-                ax.set_title("Segment Length Distribution")
+                ax.set_title("Thread Length Distribution")
                 ax.legend()
             plot_idx += 1
 
@@ -699,5 +1012,81 @@ class SpinePrior:
         if save_path:
             fig.savefig(save_path, dpi=300, bbox_inches="tight")
             logger.info(f"Saved distribution plot to {save_path}")
+
+        return fig
+
+    def plot_copulas(
+        self, figsize: Optional[Tuple[int, int]] = None, save_path: Optional[str] = None
+    ) -> Optional[plt.Figure]:
+        """Visualize fitted copulas with scatter plots."""
+        if figsize is None:
+            figsize = (15, 5)
+
+        n_copulas = len([c for c in self.copulas.values() if c["type"] == "bivariate"])
+        if n_copulas == 0:
+            logger.warning("No bivariate copulas fitted")
+            return None
+
+        fig, axes = plt.subplots(1, n_copulas, figsize=figsize)
+        if n_copulas == 1:
+            axes = [axes]
+
+        plot_idx = 0
+
+        if "length_curvature" in self.copulas:
+            ax = axes[plot_idx]
+            lengths = self.stats["thread_lengths"]
+            curvatures = self.stats["curvatures"]
+            n = min(len(lengths), len(curvatures))
+
+            ax.scatter(
+                lengths[:n],
+                curvatures[:n],
+                alpha=0.5,
+                s=20,
+                edgecolors="k",
+                linewidths=0.5,
+            )
+            ax.set_xlabel("Thread Length")
+            ax.set_ylabel("Curvature")
+            ax.set_title(f"Length-Curvature ({self.options.copula_type})")
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
+
+        if "branch" in self.copulas:
+            ax = axes[plot_idx]
+            counts = self.stats["branch_counts"]
+            angles = self.stats["branch_angles"]
+            n = min(len(counts), len(angles))
+
+            ax.scatter(
+                counts[:n], angles[:n], alpha=0.5, s=20, edgecolors="k", linewidths=0.5
+            )
+            ax.set_xlabel("Branch Count")
+            ax.set_ylabel("Branch Angle")
+            ax.set_title(f"Branch ({self.options.copula_type})")
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
+
+        if "fusion" in self.copulas:
+            ax = axes[plot_idx]
+            spatial = self.stats["fusion_distances"]
+            graph = self.stats["fusion_graph_distances"]
+            n = min(len(spatial), len(graph))
+
+            ax.scatter(
+                spatial[:n], graph[:n], alpha=0.5, s=20, edgecolors="k", linewidths=0.5
+            )
+            ax.set_xlabel("Fusion Distance (Spatial)")
+            ax.set_ylabel("Fusion Graph Distance")
+            ax.set_title(f"Fusion ({self.options.copula_type})")
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
+
+        plt.tight_layout()
+
+        if save_path:
+            fig.savefig(save_path, dpi=300, bbox_inches="tight")
+            logger.info(f"Saved copula plot to {save_path}")
 
         return fig

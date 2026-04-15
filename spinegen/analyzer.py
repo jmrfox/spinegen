@@ -1,8 +1,11 @@
 """Morphological analysis of dendritic spine cable graphs.
 
 This module provides the SpineAnalyzer class for extracting statistical
-features from spine morphologies, including segment lengths, curvatures,
+features from spine morphologies, including thread lengths, curvatures,
 branching patterns, and fusion (cycle) characteristics.
+
+Note: 'Thread' refers to continuous paths through degree-2 vertices,
+distinct from 'segment' which refers to frustum geometry of individual edges.
 """
 
 import logging
@@ -27,8 +30,8 @@ class SpineAnalyzer:
         stats: Dictionary of computed statistics (populated after analyze())
 
     Statistics Computed:
-        - segment_lengths: Path lengths between branch/leaf nodes
-        - curvatures: Angular deviations along segments
+        - thread_lengths: Path lengths of threads (continuous paths)
+        - curvatures: Angular deviations along threads
         - branch_counts: Number of branches at branch points
         - branch_angles: Angles between branches
         - radii: Node radii throughout the structure
@@ -50,12 +53,12 @@ class SpineAnalyzer:
     def analyze(self) -> Dict[str, Any]:
         """Analyze all graphs and compute morphological statistics.
 
-        This method processes each graph to extract segments, compute
+        This method processes each graph to extract threads, compute
         geometric features, and analyze branching and fusion patterns.
 
         Returns:
             Dictionary containing numpy arrays of statistics:
-                - segment_lengths: Array of segment path lengths
+                - thread_lengths: Array of thread path lengths
                 - curvatures: Array of curvature angles (radians)
                 - branch_counts: Array of branch counts at branch nodes
                 - branch_angles: Array of angles between branches (radians)
@@ -68,7 +71,7 @@ class SpineAnalyzer:
             Results are stored in self.stats and also returned.
         """
         logger.info("Starting morphological analysis")
-        all_segment_lengths = []
+        all_thread_lengths = []
         all_curvatures = []
         all_branch_counts = []
         all_branch_angles = []
@@ -91,20 +94,20 @@ class SpineAnalyzer:
                 f"Found {len(leaves)} leaves, {len(branch_nodes)} branch nodes"
             )
 
-            segments = self._extract_segments(graph, root, branch_nodes, leaves)
-            logger.debug(f"Extracted {len(segments)} segments")
+            threads = self._extract_threads(graph, root, branch_nodes, leaves)
+            logger.debug(f"Extracted {len(threads)} threads")
 
-            for segment in segments:
-                if len(segment) < 2:
+            for thread in threads:
+                if len(thread) < 2:
                     continue
 
-                length = self._compute_segment_length(graph, segment)
-                all_segment_lengths.append(length)
+                length = self._compute_thread_length(graph, thread)
+                all_thread_lengths.append(length)
 
-                curvatures = self._compute_curvatures(graph, segment)
+                curvatures = self._compute_curvatures(graph, thread)
                 all_curvatures.extend(curvatures)
 
-                for node_id in segment:
+                for node_id in thread:
                     all_radii.append(graph.get_radius(node_id))
 
             for branch_node in branch_nodes:
@@ -129,8 +132,9 @@ class SpineAnalyzer:
                         all_fusion_angles.append(fusion_data["angle"])
 
         self.stats = {
-            "segment_lengths": (
-                np.array(all_segment_lengths) if all_segment_lengths else np.array([])
+            "n_graphs": len(self.graphs),
+            "thread_lengths": (
+                np.array(all_thread_lengths) if all_thread_lengths else np.array([])
             ),
             "curvatures": np.array(all_curvatures) if all_curvatures else np.array([]),
             "branch_counts": (
@@ -154,18 +158,18 @@ class SpineAnalyzer:
         }
 
         logger.info(
-            f"Analysis complete: {len(all_segment_lengths)} segments, "
+            f"Analysis complete: {len(all_thread_lengths)} threads, "
             f"{len(all_curvatures)} curvatures, {len(all_fusion_distances)} fusions"
         )
         return self.stats
 
-    def _extract_segments(
+    def _extract_threads(
         self, graph: CableGraph, root: int, branch_nodes: List[int], leaves: List[int]
     ) -> List[List[int]]:
-        """Extract linear segments between special nodes.
+        """Extract threads (continuous paths) between special nodes.
 
-        A segment is a path between two special nodes (root, branch, or leaf)
-        that passes only through degree-2 nodes.
+        A thread is a continuous path between two special nodes (root, branch,
+        or leaf) that passes only through degree-2 nodes.
 
         Args:
             graph: CableGraph to analyze
@@ -174,20 +178,20 @@ class SpineAnalyzer:
             leaves: List of leaf node IDs (degree == 1)
 
         Returns:
-            List of segments, where each segment is a list of node IDs
+            List of threads, where each thread is a list of node IDs
             from one special node to another
         """
-        segments = []
+        threads = []
         special_nodes = set([root] + branch_nodes + leaves)
 
         for start_node in special_nodes:
             for neighbor in graph.neighbors(start_node):
-                segment = [start_node]
+                thread = [start_node]
                 current = neighbor
                 prev = start_node
 
                 while current not in special_nodes:
-                    segment.append(current)
+                    thread.append(current)
                     neighbors = list(graph.neighbors(current))
                     next_nodes = [n for n in neighbors if n != prev]
 
@@ -197,60 +201,60 @@ class SpineAnalyzer:
                     prev = current
                     current = next_nodes[0]
 
-                segment.append(current)
+                thread.append(current)
 
-                if len(segment) > 1:
-                    segments.append(segment)
+                if len(thread) > 1:
+                    threads.append(thread)
 
-        unique_segments = []
+        unique_threads = []
         seen = set()
-        for seg in segments:
-            key = tuple(sorted([seg[0], seg[-1]]))
+        for thr in threads:
+            key = tuple(sorted([thr[0], thr[-1]]))
             if key not in seen:
                 seen.add(key)
-                unique_segments.append(seg)
+                unique_threads.append(thr)
 
-        return unique_segments
+        return unique_threads
 
-    def _compute_segment_length(self, graph: CableGraph, segment: List[int]) -> float:
-        """Compute total path length of a segment.
+    def _compute_thread_length(self, graph: CableGraph, thread: List[int]) -> float:
+        """Compute total path length of a thread.
 
         Args:
-            graph: CableGraph containing the segment
-            segment: List of node IDs forming the segment
+            graph: CableGraph containing the thread
+            thread: List of node IDs forming the thread
 
         Returns:
-            Total Euclidean path length along the segment
+            Total Euclidean path length along the thread
         """
         length = 0.0
-        for i in range(len(segment) - 1):
-            p1 = graph.get_position(segment[i])
-            p2 = graph.get_position(segment[i + 1])
+        for i in range(len(thread) - 1):
+            p1 = graph.get_position(thread[i])
+            p2 = graph.get_position(thread[i + 1])
             length += euclidean_distance(p1, p2)
         return length
 
-    def _compute_curvatures(self, graph: CableGraph, segment: List[int]) -> List[float]:
-        """Compute curvature angles along a segment.
+    def _compute_curvatures(self, graph: CableGraph, thread: List[int]) -> List[float]:
+        """Compute curvature angles along a thread.
 
         Curvature is measured as the angle between consecutive edge vectors
-        at each interior node of the segment.
+        at each interior node of the thread.
 
         Args:
-            graph: CableGraph containing the segment
-            segment: List of node IDs forming the segment
+            graph: CableGraph containing the thread
+            thread: List of node IDs forming the thread
 
         Returns:
             List of curvature angles in radians (0 = straight, π = reversal)
 
         Note:
-            Requires at least 3 nodes. Returns empty list for shorter segments.
+            Requires at least 3 nodes. Returns empty list for shorter threads.
         """
         curvatures = []
 
-        for i in range(len(segment) - 2):
-            p1 = np.array(graph.get_position(segment[i]))
-            p2 = np.array(graph.get_position(segment[i + 1]))
-            p3 = np.array(graph.get_position(segment[i + 2]))
+        for i in range(len(thread) - 2):
+            p1 = np.array(graph.get_position(thread[i]))
+            p2 = np.array(graph.get_position(thread[i + 1]))
+            p3 = np.array(graph.get_position(thread[i + 2]))
 
             v1 = p2 - p1
             v2 = p3 - p2

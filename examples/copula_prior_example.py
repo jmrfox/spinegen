@@ -12,9 +12,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from spinegen import (
     CableGraph,
     SpineAnalyzer,
-    ConditionalSpinePrior,
-    SpineGenerator,
     SpinePrior,
+    SpinePriorOptions,
+    SpineGenerator,
 )
 import matplotlib.pyplot as plt
 
@@ -41,10 +41,11 @@ results = {}
 for copula_type in copula_types:
     print(f"\n--- Testing {copula_type.upper()} copula ---")
 
-    # Create conditional prior
-    prior = ConditionalSpinePrior(
-        analyzer.stats, copula_type=copula_type, use_multivariate=False
+    # Create prior with copula options
+    options = SpinePriorOptions(
+        use_copulas=True, copula_type=copula_type, use_multivariate=False
     )
+    prior = SpinePrior(analyzer.stats, options=options)
 
     print(prior)
 
@@ -79,9 +80,10 @@ print("=" * 70)
 for mv_type in ["gaussian", "vine"]:
     print(f"\n--- Testing {mv_type.upper()} multivariate copula ---")
 
-    prior_mv = ConditionalSpinePrior(
-        analyzer.stats, use_multivariate=True, multivariate_type=mv_type
+    options_mv = SpinePriorOptions(
+        use_copulas=True, use_multivariate=True, multivariate_type=mv_type
     )
+    prior_mv = SpinePrior(analyzer.stats, options=options_mv)
 
     print(prior_mv)
 

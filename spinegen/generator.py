@@ -101,7 +101,7 @@ class SpineGenerator:
             new_tips = []
 
             for tip_id, prev_direction in active_tips:
-                step_length = self.prior.sample_segment_length()
+                step_length = self.prior.sample_thread_length()
 
                 if prev_direction is None:
                     direction = self._random_unit_vector()
